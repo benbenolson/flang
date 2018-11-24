@@ -1632,6 +1632,33 @@ void __fort_gfree(void *ptr);
 
 void *__fort_gsbrk(int n);
 
+/* SICM functions */
+char *I8(__sh_fort_alloc)(int id, __INT_T nelem, dtype kind,
+                           size_t len, __STAT_T *stat,
+                           char **pointer, __POINT_T *offset, char *base, int check,
+                           void *(*mallocfn)(int, size_t));
+char *I8(__sh_fort_allocate)(int id, int nelem, dtype kind, 
+                              size_t len, char *base,
+                              char **pointer, __POINT_T *offset);
+char *I8(__sh_fort_local_allocate)(int id, int nelem, 
+                                    dtype kind, size_t len, char *base,
+                                    char **pointer, __POINT_T *offset);
+char *I8(__sh_fort_dealloc)(char *area, __STAT_T *stat, void (*freefn)(void *));
+void I8(__sh_fort_deallocate)(char *area);
+void I8(__sh_fort_local_deallocate)(char *area);
+void *__sh_fort_malloc_without_abort(int id, size_t n);
+void *__sh_fort_calloc_without_abort(int id, size_t n);
+void *__sh_fort_malloc(int id, size_t n);
+void *__sh_fort_realloc(int id, void *ptr, size_t n);
+void *__sh_fort_calloc(int id, size_t n, size_t s);
+void __sh_fort_free(void *ptr);
+void *__sh_fort_gmalloc_without_abort(int id, size_t n);
+void *__sh_fort_gcalloc_without_abort(int id, size_t n);
+void *__sh_fort_gmalloc(int id, size_t n);
+void *__sh_fort_grealloc(int id, void *ptr, size_t n);
+void *__sh_fort_gcalloc(int id, size_t n, size_t s);
+void __sh_fort_gfree(void *ptr);
+
 /* group */
 
 struct cgrp {

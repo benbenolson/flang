@@ -31,6 +31,9 @@
 #include "mpalloc.h"
 #include "f90alloc.h"
 
+void *sh_alloc(int id, size_t n);
+void sh_free(void *ptr);
+
 MP_SEMAPHORE(static, sem);
 
 #include "fort_vars.h"
@@ -369,6 +372,140 @@ I8(__fort_alloc)(__INT_T nelem, dtype kind, size_t len, __STAT_T *stat,
   return area;
 }
 
+char *
+I8(__sh_fort_alloc)(int id, __INT_T nelem, dtype kind, size_t len, __STAT_T *stat,
+                 char **pointer, __POINT_T *offset, char *base, int check,
+                 void *(*mallocfn)(int, size_t))
+{
+  ALLO_HDR *p;
+  char *area;
+  size_t need, size, slop, sizeof_hdr;
+  __POINT_T off;
+  char msg[80];
+  char *p_env;
+
+#if (defined(WIN64) || defined(WIN32))
+#define ALN_LARGE
+#else
+#undef ALN_LARGE
+#endif
+/* always use the larger padding   - used be for just win, but
+ * now it makes a bug difference on linux with newer (since Jul 2007)
+ * processor.
+ */
+#define ALN_LARGE
+
+  size_t ALN_MINSZ = 128000;
+  size_t ALN_UNIT = 64;
+  size_t ALN_MAXADJ = 4096;
+
+#define ALN_THRESH (ALN_MAXADJ / ALN_UNIT)
+  static int aln_n = 0;
+  static int env_checked = 0;
+  int myaln;
+
+  sizeof_hdr = AUTOASZ;
+
+  if (!env_checked) {
+    env_checked = 1;
+
+    p_env = getenv("F90_ALN_MINSZ");
+    if (p_env != NULL)
+      ALN_MINSZ = atol(p_env);
+
+    p_env = getenv("F90_ALN_UNIT");
+    if (p_env != NULL)
+      ALN_UNIT = atol(p_env);
+
+    p_env = getenv("F90_ALN_MAXADJ");
+    if (p_env != NULL)
+      ALN_MAXADJ = atol(p_env);
+  }
+
+  ALLHDR();
+
+  if (!ISPRESENT(stat))
+    stat = NULL;
+  if (!ISPRESENT(pointer))
+    pointer = NULL;
+  if (!ISPRESENT(offset))
+    offset = NULL;
+  need = (nelem <= 0) ? 0 : (size_t)nelem * len;
+  slop = 0;
+  /* SLOPPY COMMENT:
+   * here, we add some slop so we can align the eventual
+   * allocated address after adding the size of the ALLO_HDR.
+   * We are going to align to ASZ.  Since we know that the malloc
+   * function returns something at least 8-byte aligned, we only
+   * should have to add (ASZ-8) slop.
+   * Actually, we shouldn't even have to do this if we know
+   * that the malloc function returns aligned results and
+   * skipping ALLO_HDR will keep it aligned */
+  if (nelem > 1 || need > 2 * sizeof_hdr)
+    slop = (offset && len > (ASZ - 8)) ? len : (ASZ - 8);
+  size = (sizeof_hdr + slop + need + ASZ - 1) & ~(ASZ - 1);
+  MP_P(sem);
+  if (size > ALN_MINSZ) {
+    myaln = aln_n;
+    size += ALN_UNIT * myaln;
+    if (aln_n < ALN_THRESH)
+      aln_n++;
+    else
+      aln_n = 0;
+  }
+  p = (size < need) ? NULL : (ALLO_HDR *)mallocfn(id, size);
+  MP_V(sem);
+  if (p == NULL) {
+    if (pointer)
+      *pointer = NULL;
+    if (offset)
+      *offset = 1;
+    if (stat) {
+      *stat = 1;
+      return NULL;
+    }
+    MP_P_STDIO;
+    sprintf(msg, "ALLOCATE: %lu bytes requested; not enough memory", need);
+    MP_V_STDIO;
+    __fort_abort(msg);
+  }
+  if (stat)
+    *stat = 0;
+  area = (char *)p + sizeof_hdr;
+  if (offset) {
+    off = area - base + len - 1;
+    if (kind != __STR && kind != __DERIVED)
+      off >>= GET_DIST_SHIFTS(kind);
+    else
+      off /= len;
+
+    *offset = off + 1;
+    area = base + off * len;
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d alloc: need %lu size %lu p %p area %p end %p"
+             " base %p offset %ld len %lu\n",
+             GET_DIST_LCPU, need, size, p, area, (char *)p + size - 1, base,
+             *offset, len);
+#endif
+  } else {
+    /* see SLOPPY COMMENT above */
+    if (nelem > 1 || need > 2 * sizeof_hdr)
+      area = ALIGNP(area, ASZ);
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d alloc: need %lu size %lu p %p area %p end %p\n",
+             GET_DIST_LCPU, need, size, p, area, (char *)p + size - 1);
+#endif
+  }
+  if (size > ALN_MINSZ)
+    area += ALN_UNIT * myaln;
+  XYZZYP(area, p);
+  if (pointer)
+    *pointer = area;
+  return area;
+}
+
 /** \brief
  * allocate space using given 'malloc' function. if present, set
  * pointer and pointer-sized integer offset from base address. offset
@@ -519,6 +656,151 @@ I8(__alloc04)(__NELEM_T nelem, dtype kind, size_t len,
   return area;
 }
 
+static char *
+I8(__sh_alloc04)(int id, __NELEM_T nelem, dtype kind, size_t len,
+               __STAT_T *stat, char **pointer, __POINT_T *offset,
+               char *base, int check, void *(*mallocfn)(int, size_t),
+               size_t align, char *errmsg, int errlen)
+{
+  ALLO_HDR *p;
+  char *area;
+  size_t need, size, slop, sizeof_hdr;
+  __POINT_T off;
+  char msg[80];
+  char *p_env;
+
+  if (!ISPRESENT(stat))
+    stat = NULL;
+  if (!ISPRESENT(pointer))
+    pointer = NULL;
+  if (!ISPRESENT(offset))
+    offset = NULL;
+  if (!ISPRESENT(errmsg))
+    errmsg = NULL;
+
+#if (defined(WIN64) || defined(WIN32))
+#define ALN_LARGE
+#else
+#undef ALN_LARGE
+#endif
+/* always use the larger padding   - used be for just win, but
+ * now it makes a bug difference on linux with newer (since Jul 2007)
+ * processor.
+ */
+#define ALN_LARGE
+
+  size_t ALN_MINSZ = 128000;
+  size_t ALN_UNIT = 64;
+  size_t ALN_MAXADJ = 4096;
+
+#define ALN_THRESH (ALN_MAXADJ / ALN_UNIT)
+  static int aln_n = 0;
+  static int env_checked = 0;
+  int myaln;
+
+  sizeof_hdr = AUTOASZ;
+
+  if (!env_checked) {
+    env_checked = 1;
+
+    p_env = getenv("F90_ALN_MINSZ");
+    if (p_env != NULL)
+      ALN_MINSZ = atol(p_env);
+
+    p_env = getenv("F90_ALN_UNIT");
+    if (p_env != NULL)
+      ALN_UNIT = atol(p_env);
+
+    p_env = getenv("F90_ALN_MAXADJ");
+    if (p_env != NULL)
+      ALN_MAXADJ = atol(p_env);
+  }
+
+  ALLHDR();
+  need = (nelem <= 0) ? 0 : (size_t)nelem * len;
+  if (!need) /* should this be size < ASZ ?? */
+    need = ASZ;
+  slop = 0;
+  /* SLOPPY COMMENT:
+   * here, we add some slop so we can align the eventual
+   * allocated address after adding the size of the ALLO_HDR.
+   * We are going to align to ASZ.  Since we know that the malloc
+   * function returns something at least 8-byte aligned, we only
+   * should have to add (ASZ-8) slop.
+   * Actually, we shouldn't even have to do this if we know
+   * that the malloc function returns aligned results and
+   * skipping ALLO_HDR will keep it aligned */
+  if (nelem > 1 || need > 2 * sizeof_hdr)
+    slop = (offset && len > (ASZ - 8)) ? len : (ASZ - 8);
+  size = (sizeof_hdr + slop + need + ASZ - 1) & ~(ASZ - 1);
+  if (size > ALN_MINSZ) {
+    myaln = aln_n;
+    size += ALN_UNIT * myaln;
+    if (aln_n < ALN_THRESH)
+      aln_n++;
+    else
+      aln_n = 0;
+  }
+  p = (size < need) ? NULL : (ALLO_HDR *)mallocfn(id, size);
+  if (p == NULL) {
+    if (pointer)
+      *pointer = NULL;
+    if (offset)
+      *offset = 1;
+    if (stat) {
+      *stat = 1;
+      if (errmsg) {
+        int i;
+        char *mp;
+        MP_P_STDIO;
+        sprintf(msg, "Not enough memory to allocate %lu bytes", need);
+        mp = msg;
+        for (i = 0; i < errlen; i++)
+          errmsg[i] = (*mp ? *mp++ : ' ');
+        MP_V_STDIO;
+      }
+      return NULL;
+    }
+    MP_P_STDIO;
+    sprintf(msg, "ALLOCATE: %lu bytes requested; not enough memory", need);
+    MP_V_STDIO;
+    __fort_abort(msg);
+  }
+  area = (char *)p + sizeof_hdr;
+  if (offset) {
+    off = area - base + len - 1;
+    if (kind != __STR && kind != __DERIVED)
+      off >>= GET_DIST_SHIFTS(kind);
+    else
+      off /= len;
+
+    *offset = off + 1;
+    area = base + off * len;
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d alloc: need %lu size %lu p %p area %p end %p"
+             " base %p offset %ld len %lu\n",
+             GET_DIST_LCPU, need, size, p, area, (char *)p + size - 1, base,
+             *offset, len);
+#endif
+  } else {
+    /* see SLOPPY COMMENT above */
+    if (nelem > 1 || need > 2 * sizeof_hdr)
+      area = ALIGNP(area, ASZ);
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d alloc: need %lu size %lu p %p area %p end %p\n",
+             GET_DIST_LCPU, need, size, p, area, (char *)p + size - 1);
+#endif
+  }
+  if (size > ALN_MINSZ)
+    area += ALN_UNIT * myaln;
+  XYZZYP(area, p);
+  if (pointer)
+    *pointer = area;
+  return area;
+}
+
 /** \brief
  * allocate space using given 'malloc' function. if present, set
  * pointer and pointer-sized integer offset from base address. offset
@@ -554,6 +836,85 @@ I8(__fort_kalloc)(__INT8_T nelem, dtype kind, size_t len, __STAT_T *stat,
   size = (sizeof_hdr + slop + need + ASZ - 1) & ~(ASZ - 1);
   MP_P(sem);
   p = (size < need) ? NULL : (ALLO_HDR *)mallocfn(size);
+  MP_V(sem);
+  if (p == NULL) {
+    if (pointer)
+      *pointer = NULL;
+    if (offset)
+      *offset = 1;
+    if (stat) {
+      *stat = 1;
+      return NULL;
+    }
+    MP_P_STDIO;
+    sprintf(msg, "ALLOCATE: %lu bytes requested; not enough memory", need);
+    MP_V_STDIO;
+    __fort_abort(msg);
+  }
+  if (stat)
+    *stat = 0;
+  area = (char *)p + sizeof_hdr;
+  if (offset) {
+    off = area - base + len - 1;
+    if (kind != __STR && kind != __DERIVED)
+      off >>= GET_DIST_SHIFTS(kind);
+    else
+      off /= len;
+
+    *offset = off + 1;
+    area = base + off * len;
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d alloc: need %lu size %lu p %p area %p end %p"
+             " base %p offset %ld len %lu\n",
+             GET_DIST_LCPU, need, size, p, area, (char *)p + size - 1, base,
+             *offset, len);
+#endif
+  } else {
+    /* see SLOPPY COMMENT above */
+    if (nelem > 1 || need > 2 * sizeof_hdr)
+      area = ALIGNP(area, ASZ);
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d alloc: need %lu size %lu p %p area %p end %p\n",
+             GET_DIST_LCPU, need, size, p, area, (char *)p + size - 1);
+#endif
+  }
+  if (pointer)
+    *pointer = area;
+  return area;
+}
+
+char *
+I8(__sh_fort_kalloc)(int id, __INT8_T nelem, dtype kind, size_t len, __STAT_T *stat,
+                  char **pointer, __POINT_T *offset, char *base, int check,
+                  void *(*mallocfn)(int, size_t))
+{
+  ALLO_HDR *p;
+  char *area;
+  size_t need, size, slop, sizeof_hdr;
+  __POINT_T off;
+  char msg[80];
+
+  ALLHDR();
+
+  if (!ISPRESENT(stat))
+    stat = NULL;
+  if (!ISPRESENT(pointer))
+    pointer = NULL;
+  if (!ISPRESENT(offset))
+    offset = NULL;
+
+  sizeof_hdr = AUTOASZ;
+
+  need = (nelem <= 0) ? 0 : (size_t)nelem * len;
+  /* see SLOPPY COMMENT above */
+  slop = 0;
+  if (nelem > 1 || need > 2 * sizeof_hdr)
+    slop = (offset && len > (ASZ / 2)) ? len : (ASZ / 2);
+  size = (sizeof_hdr + slop + need + ASZ - 1) & ~(ASZ - 1);
+  MP_P(sem);
+  p = (size < need) ? NULL : (ALLO_HDR *)mallocfn(id, size);
   MP_V(sem);
   if (p == NULL) {
     if (pointer)
@@ -858,6 +1219,30 @@ ENTF90(ALLOCA, alloca)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
   }
 }
 
+void
+ENTF90(SH_ALLOCA, sh_alloca)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                       __STAT_T *stat, char **pointer, __POINT_T *offset,
+                       DCHAR(base) DCLEN64(base))
+{
+
+  ALLHDR();
+
+  if (!ISPRESENT(stat)) {
+    void *salp;
+    salp = use_alloc(*nelem, *len);
+    if (salp) {
+      *pointer = salp;
+      return;
+    }
+  }
+  (void)I8(__sh_fort_alloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 1,
+      LOCAL_MODE ? __sh_fort_malloc_without_abort : __sh_fort_gmalloc_without_abort);
+  if (!ISPRESENT(stat)) {
+    save_alloc(*nelem, *len, pointer);
+  }
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(ALLOC, alloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -865,6 +1250,15 @@ ENTF90(ALLOC, alloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                      DCHAR(base) DCLEN(base))
 {
   ENTF90(ALLOCA, alloca)(nelem, kind, len, stat, pointer, offset, CADR(base),
+                         (__CLEN_T)CLEN(base));
+}
+
+void
+ENTF90(SH_ALLOC, sh_alloc)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                     __STAT_T *stat, char **pointer, __POINT_T *offset,
+                     DCHAR(base) DCLEN(base))
+{
+  ENTF90(sh_ALLOCA, sh_alloca)(id, nelem, kind, len, stat, pointer, offset, CADR(base),
                          (__CLEN_T)CLEN(base));
 }
 
@@ -895,6 +1289,33 @@ ENTF90(ALLOC03A, alloc03a)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
   }
 }
 
+void
+ENTF90(SH_ALLOC03A, sh_alloc03a)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  ALLHDR();
+
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  if (!ISPRESENT(stat)) {
+    void *salp;
+    salp = use_alloc(*nelem, *len);
+    if (salp) {
+      *pointer = salp;
+      return;
+    }
+  }
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 1, LOCAL_MODE ? __sh_fort_malloc_without_abort
+                                       : __sh_fort_gmalloc_without_abort,
+                      0, CADR(errmsg), CLEN(errmsg));
+  if (!ISPRESENT(stat)) {
+    save_alloc(*nelem, *len, pointer);
+  }
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(ALLOC03, alloc03)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -902,6 +1323,15 @@ ENTF90(ALLOC03, alloc03)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                          __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(ALLOC03A, alloc03a)(nelem, kind, len, stat, pointer, offset,
+                             firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_ALLOC03, sh_alloc03)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_ALLOC03A, sh_alloc03a)(id, nelem, kind, len, stat, pointer, offset,
                              firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
 
@@ -918,6 +1348,19 @@ ENTF90(ALLOC03_CHKA, alloc03_chka)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                             firsttime,CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_ALLOC03_CHKA, sh_alloc03_chka)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, DCHAR(errmsg) DCLEN64(errmsg))
+{
+
+  if (*pointer && I8(__fort_allocated)(*pointer)) {
+    __fort_abort("ALLOCATE: array already allocated");
+  }
+  ENTF90(SH_ALLOC03,sh_alloc03)(id, nelem, kind, len, stat, pointer, offset,
+                            firsttime,CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(ALLOC03_CHK, alloc03_chk)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -925,6 +1368,16 @@ ENTF90(ALLOC03_CHK, alloc03_chk)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                          __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(ALLOC03_CHKA, alloc03_chka)(nelem, kind, len,
+                         stat, pointer, offset,
+                         firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_ALLOC03_CHK, sh_alloc03_chk)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_ALLOC03_CHKA, sh_alloc03_chka)(id, nelem, kind, len,
                          stat, pointer, offset,
                          firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
@@ -957,6 +1410,34 @@ ENTF90(ALLOC04A, alloc04a)(__NELEM_T *nelem, __INT_T *kind, __INT_T *len,
   }
 }
 
+void
+ENTF90(SH_ALLOC04A, sh_alloc04a)(int id, __NELEM_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, __NELEM_T *align,
+                         DCHAR(errmsg) DCLEN64(errmsg))
+{
+  ALLHDR();
+
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  if (!ISPRESENT(stat) && !*align) {
+    void *salp;
+    salp = use_alloc(*nelem, *len);
+    if (salp) {
+      *pointer = salp;
+      return;
+    }
+  }
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 1, LOCAL_MODE ? __sh_fort_malloc_without_abort
+                                       : __sh_fort_gmalloc_without_abort,
+                      *align, CADR(errmsg), CLEN(errmsg));
+  if (!ISPRESENT(stat)) {
+    save_alloc(*nelem, *len, pointer);
+  }
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(ALLOC04, alloc04)(__NELEM_T *nelem, __INT_T *kind, __INT_T *len,
@@ -965,6 +1446,16 @@ ENTF90(ALLOC04, alloc04)(__NELEM_T *nelem, __INT_T *kind, __INT_T *len,
                          DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(ALLOC04A, alloc04a)(nelem, kind, len, stat, pointer, offset, firsttime, 
+			   align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_ALLOC04, sh_alloc04)(int id, __NELEM_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, __NELEM_T *align,
+                         DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_ALLOC04A, sh_alloc04a)(id, nelem, kind, len, stat, pointer, offset, firsttime, 
 			   align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
 
@@ -983,6 +1474,21 @@ ENTF90(ALLOC04_CHKA, alloc04_chka)(__NELEM_T *nelem, __INT_T *kind,
            align, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_ALLOC04_CHKA, sh_alloc04_chka)(int id, __NELEM_T *nelem, __INT_T *kind,
+                                 __INT_T *len, __STAT_T *stat,
+                                 char **pointer, __POINT_T *offset,
+                                 __INT_T *firsttime, __NELEM_T *align,
+                                 DCHAR(errmsg) DCLEN64(errmsg))
+{
+
+  if (*pointer && I8(__fort_allocated)(*pointer)) {
+    __fort_abort("ALLOCATE: array already allocated");
+  }
+  ENTF90(SH_ALLOC04,sh_alloc04)(id, nelem, kind, len, stat, pointer, offset, firsttime,
+           align, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(ALLOC04_CHK, alloc04_chk)(__NELEM_T *nelem, __INT_T *kind,
@@ -992,6 +1498,17 @@ ENTF90(ALLOC04_CHK, alloc04_chk)(__NELEM_T *nelem, __INT_T *kind,
                                  DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(ALLOC04_CHKA, alloc04_chka)(nelem, kind, len, stat, pointer, offset,
+                                     firsttime, align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_ALLOC04_CHK, sh_alloc04_chk)(int id, __NELEM_T *nelem, __INT_T *kind,
+                                 __INT_T *len, __STAT_T *stat,
+                                 char **pointer, __POINT_T *offset,
+                                 __INT_T *firsttime, __NELEM_T *align,
+                                 DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_ALLOC04_CHKA, sh_alloc04_chka)(id, nelem, kind, len, stat, pointer, offset,
                                      firsttime, align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
 
@@ -1017,6 +1534,27 @@ ENTF90(KALLOC, kalloc)(__INT8_T *nelem, __INT_T *kind, __INT_T *len,
 }
 
 void
+ENTF90(SH_KALLOC, sh_kalloc)(int id, __INT8_T *nelem, __INT_T *kind, __INT_T *len,
+                       __STAT_T *stat, char **pointer, __POINT_T *offset,
+                       DCHAR(base) DCLEN(base))
+{
+  if (!ISPRESENT(stat)) {
+    void *salp;
+    salp = use_alloc(*nelem, *len);
+    if (salp) {
+      *pointer = salp;
+      return;
+    }
+  }
+  (void)I8(__sh_fort_kalloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 1,
+      LOCAL_MODE ? __sh_fort_malloc_without_abort : __sh_fort_gmalloc_without_abort);
+  if (!ISPRESENT(stat)) {
+    save_alloc(*nelem, *len, pointer);
+  }
+}
+
+void
 ENTF90(CALLOC, calloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                        __STAT_T *stat, char **pointer, __POINT_T *offset,
                        DCHAR(base) DCLEN(base))
@@ -1024,6 +1562,16 @@ ENTF90(CALLOC, calloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
   (void)I8(__fort_alloc)(
       *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 1,
       LOCAL_MODE ? __fort_calloc_without_abort : __fort_gcalloc_without_abort);
+}
+
+void
+ENTF90(SH_CALLOC, sh_calloc)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                       __STAT_T *stat, char **pointer, __POINT_T *offset,
+                       DCHAR(base) DCLEN(base))
+{
+  (void)I8(__sh_fort_alloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 1,
+      LOCAL_MODE ? __sh_fort_calloc_without_abort : __sh_fort_gcalloc_without_abort);
 }
 
 void
@@ -1041,6 +1589,21 @@ ENTF90(CALLOC03A, calloc03a)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                       0, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_CALLOC03A, sh_calloc03a)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                           __STAT_T *stat, char **pointer,
+                           __POINT_T *offset, __INT_T *firsttime,
+                           DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 1, LOCAL_MODE ? __sh_fort_calloc_without_abort
+                                       : __sh_fort_gcalloc_without_abort,
+                      0, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(CALLOC03, calloc03)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -1049,6 +1612,18 @@ ENTF90(CALLOC03, calloc03)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                            DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(CALLOC03A, calloc03a)(nelem, kind, len,
+                           stat, pointer,
+                           offset, firsttime,
+                           CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_CALLOC03, sh_calloc03)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                           __STAT_T *stat, char **pointer,
+                           __POINT_T *offset, __INT_T *firsttime,
+                           DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_CALLOC03A, sh_calloc03a)(id, nelem, kind, len,
                            stat, pointer,
                            offset, firsttime,
                            CADR(errmsg), (__CLEN_T)CLEN(errmsg));
@@ -1069,6 +1644,21 @@ ENTF90(CALLOC04A, calloc04a)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                       *align, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_CALLOC04A, sh_calloc04a)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                           __STAT_T *stat, char **pointer,
+                           __POINT_T *offset, __INT_T *firsttime,
+                           __NELEM_T *align, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 1, LOCAL_MODE ? __sh_fort_calloc_without_abort
+                                       : __sh_fort_gcalloc_without_abort,
+                      *align, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(CALLOC04, calloc04)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -1077,6 +1667,18 @@ ENTF90(CALLOC04, calloc04)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                            __NELEM_T *align, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(CALLOC04A, calloc04a)(nelem, kind, len,
+                           stat, pointer,
+                           offset, firsttime,
+                           align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_CALLOC04, sh_calloc04)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                           __STAT_T *stat, char **pointer,
+                           __POINT_T *offset, __INT_T *firsttime,
+                           __NELEM_T *align, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_CALLOC04A, sh_calloc04a)(id, nelem, kind, len,
                            stat, pointer,
                            offset, firsttime,
                            align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
@@ -1092,6 +1694,16 @@ ENTF90(KCALLOC, kcalloc)(__INT8_T *nelem, __INT_T *kind, __INT_T *len,
       LOCAL_MODE ? __fort_calloc_without_abort : __fort_gcalloc_without_abort);
 }
 
+void
+ENTF90(SH_KCALLOC, sh_kcalloc)(int id, __INT8_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         DCHAR(base) DCLEN(base))
+{
+  (void)I8(__sh_fort_kalloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 1,
+      LOCAL_MODE ? __sh_fort_calloc_without_abort : __sh_fort_gcalloc_without_abort);
+}
+
 /** \brief
  * F90 allocate statement -- don't check allocated status
  */
@@ -1105,6 +1717,16 @@ ENTF90(PTR_ALLOCA, ptr_alloca)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
       LOCAL_MODE ? __fort_malloc_without_abort : __fort_gmalloc_without_abort);
 }
 
+void
+ENTF90(SH_PTR_ALLOCA, sh_ptr_alloca)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                             __STAT_T *stat, char **pointer,
+                             __POINT_T *offset, DCHAR(base) DCLEN64(base))
+{
+  (void)I8(__sh_fort_alloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 0,
+      LOCAL_MODE ? __sh_fort_malloc_without_abort : __sh_fort_gmalloc_without_abort);
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_ALLOC, ptr_alloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -1112,6 +1734,16 @@ ENTF90(PTR_ALLOC, ptr_alloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                              __POINT_T *offset, DCHAR(base) DCLEN(base))
 {
   ENTF90(PTR_ALLOCA, ptr_alloca)(nelem, kind, len,
+                             stat, pointer,
+                             offset, CADR(base), (__CLEN_T)CLEN(base));
+}
+
+void
+ENTF90(SH_PTR_ALLOC, sh_ptr_alloc)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                             __STAT_T *stat, char **pointer,
+                             __POINT_T *offset, DCHAR(base) DCLEN(base))
+{
+  ENTF90(SH_PTR_ALLOCA, sh_ptr_alloca)(id, nelem, kind, len,
                              stat, pointer,
                              offset, CADR(base), (__CLEN_T)CLEN(base));
 }
@@ -1132,6 +1764,20 @@ ENTF90(PTR_ALLOC03A, ptr_alloc03a)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                                        : __fort_gmalloc_without_abort,
                       0, CADR(errmsg), CLEN(errmsg));
 }
+
+void
+ENTF90(SH_PTR_ALLOC03A, sh_ptr_alloc03a)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 0, LOCAL_MODE ? __sh_fort_malloc_without_abort
+                                       : __sh_fort_gmalloc_without_abort,
+                      0, CADR(errmsg), CLEN(errmsg));
+}
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_ALLOC03, ptr_alloc03)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
@@ -1139,6 +1785,16 @@ ENTF90(PTR_ALLOC03, ptr_alloc03)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                          __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_ALLOC03A, ptr_alloc03a)(nelem, kind, len,
+                         stat, pointer, offset,
+                         firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_ALLOC03, sh_ptr_alloc03)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                         __STAT_T *stat, char **pointer, __POINT_T *offset,
+                         __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_ALLOC03A, sh_ptr_alloc03a)(id, nelem, kind, len,
                          stat, pointer, offset,
                          firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
@@ -1160,6 +1816,22 @@ ENTF90(PTR_ALLOC04A, ptr_alloc04a)(__NELEM_T *nelem, __INT_T *kind,
 }
 
 void
+ENTF90(SH_PTR_ALLOC04A, sh_ptr_alloc04a)(int id, __NELEM_T *nelem, __INT_T *kind,
+                                 __INT_T *len, __STAT_T *stat,
+                                 char **pointer, __POINT_T *offset,
+                                 __INT_T *firsttime, __NELEM_T *align,
+                                 DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 0, LOCAL_MODE ? __sh_fort_malloc_without_abort
+                                       : __sh_fort_gmalloc_without_abort,
+                      *align, CADR(errmsg), CLEN(errmsg));
+}
+
+void
 ENTF90(PTR_ALLOC04, ptr_alloc04)(__NELEM_T *nelem, __INT_T *kind,
                                  __INT_T *len, __STAT_T *stat,
                                  char **pointer, __POINT_T *offset,
@@ -1167,6 +1839,20 @@ ENTF90(PTR_ALLOC04, ptr_alloc04)(__NELEM_T *nelem, __INT_T *kind,
                                  DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_ALLOC04A, ptr_alloc04a)(nelem, kind,
+                                 len, stat,
+                                 pointer, offset,
+                                 firsttime, align,
+                                 CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_ALLOC04, sh_ptr_alloc04)(int id, __NELEM_T *nelem, __INT_T *kind,
+                                 __INT_T *len, __STAT_T *stat,
+                                 char **pointer, __POINT_T *offset,
+                                 __INT_T *firsttime, __NELEM_T *align,
+                                 DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_ALLOC04A, sh_ptr_alloc04a)(id, nelem, kind,
                                  len, stat,
                                  pointer, offset,
                                  firsttime, align,
@@ -1203,6 +1889,30 @@ ENTF90(PTR_SRC_ALLOC03A, ptr_src_alloc03a)(F90_Desc *sd, __INT_T *nelem,
                       0, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_PTR_SRC_ALLOC03A, sh_ptr_src_alloc03a)(int id, F90_Desc *sd, __INT_T *nelem,
+                             __INT_T *kind, __INT_T *len, __STAT_T *stat,
+                             char **pointer, __POINT_T *offset,
+                             __INT_T *firsttime, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  __INT_T src_len, max_len;
+
+  src_len = ENTF90(GET_OBJECT_SIZE, get_object_size)(sd);
+  if (sd && sd->tag == __DESC && sd->lsize > 1)
+    src_len *= sd->lsize;
+  max_len = (len && nelem) ? (*len * *nelem) : 0;
+  if (max_len < src_len)
+    max_len = src_len;
+
+  if (ISPRESENT(stat) && firsttime && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)max_len, stat, pointer,
+                      offset, 0, 0, LOCAL_MODE ? __sh_fort_malloc_without_abort
+                                               : __sh_fort_gmalloc_without_abort,
+                      0, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_SRC_ALLOC03, ptr_src_alloc03)(F90_Desc *sd, __INT_T *nelem,
@@ -1211,6 +1921,18 @@ ENTF90(PTR_SRC_ALLOC03, ptr_src_alloc03)(F90_Desc *sd, __INT_T *nelem,
                              __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_SRC_ALLOC03A, ptr_src_alloc03a)(sd, nelem,
+                             kind, len, stat,
+                             pointer, offset,
+                             firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_SRC_ALLOC03, sh_ptr_src_alloc03)(int id, F90_Desc *sd, __INT_T *nelem,
+                             __INT_T *kind, __INT_T *len, __STAT_T *stat,
+                             char **pointer, __POINT_T *offset,
+                             __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_SRC_ALLOC03A, sh_ptr_src_alloc03a)(id, sd, nelem,
                              kind, len, stat,
                              pointer, offset,
                              firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
@@ -1241,12 +1963,48 @@ ENTF90(PTR_SRC_CALLOC03A, ptr_src_calloc03a)(F90_Desc *sd, __INT_T *nelem,
 }
 
 void
+ENTF90(SH_PTR_SRC_CALLOC03A, sh_ptr_src_calloc03a)(int id, F90_Desc *sd, __INT_T *nelem,
+                              __INT_T *kind, __INT_T *len, __STAT_T *stat,
+                              char **pointer, __POINT_T *offset,
+                             __INT_T *firsttime, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  __INT_T src_len, max_len;
+
+  src_len = ENTF90(GET_OBJECT_SIZE, get_object_size)(sd);
+  if (sd && sd->tag == __DESC && sd->lsize > 1)
+    src_len *= sd->lsize;
+  max_len = (len && nelem) ? (*len * *nelem) : 0;
+  if (max_len < src_len)
+    max_len = src_len;
+
+  if (ISPRESENT(stat) && firsttime && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)max_len, stat, pointer,
+                      offset, 0, 0, LOCAL_MODE ? __sh_fort_calloc_without_abort
+                                               : __sh_fort_gcalloc_without_abort,
+                      0, CADR(errmsg), CLEN(errmsg));
+}
+
+void
 ENTF90(PTR_SRC_CALLOC03, ptr_src_calloc03)(F90_Desc *sd, __INT_T *nelem,
                               __INT_T *kind, __INT_T *len, __STAT_T *stat,
                               char **pointer, __POINT_T *offset,
                              __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_SRC_CALLOC03A, ptr_src_calloc03a)(sd, nelem,
+                              kind, len, stat,
+                              pointer, offset,
+                             firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_SRC_CALLOC03, sh_ptr_src_calloc03)(int id, F90_Desc *sd, __INT_T *nelem,
+                              __INT_T *kind, __INT_T *len, __STAT_T *stat,
+                              char **pointer, __POINT_T *offset,
+                             __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_SRC_CALLOC03A, sh_ptr_src_calloc03a)(id, sd, nelem,
                               kind, len, stat,
                               pointer, offset,
                              firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
@@ -1277,6 +2035,31 @@ ENTF90(PTR_SRC_ALLOC04A, ptr_src_alloc04a)(F90_Desc *sd, __NELEM_T *nelem,
                       *align, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_PTR_SRC_ALLOC04A, sh_ptr_src_alloc04a)(int id, F90_Desc *sd, __NELEM_T *nelem,
+                             __INT_T *kind, __INT_T *len, __STAT_T *stat,
+                             char **pointer, __POINT_T *offset,
+                             __INT_T *firsttime, __NELEM_T *align,
+                             DCHAR(errmsg) DCLEN64(errmsg))
+{
+  __INT_T src_len, max_len;
+
+  src_len = ENTF90(GET_OBJECT_SIZE, get_object_size)(sd);
+  if (sd && sd->tag == __DESC && sd->lsize > 1)
+    src_len *= sd->lsize;
+  max_len = (len && nelem) ? (*len * *nelem) : 0;
+  if (max_len < src_len)
+    max_len = src_len;
+
+  if (ISPRESENT(stat) && firsttime && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)max_len, stat, pointer,
+                      offset, 0, 0, LOCAL_MODE ? __sh_fort_malloc_without_abort
+                                               : __sh_fort_gmalloc_without_abort,
+                      *align, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_SRC_ALLOC04, ptr_src_alloc04)(F90_Desc *sd, __NELEM_T *nelem,
@@ -1286,6 +2069,20 @@ ENTF90(PTR_SRC_ALLOC04, ptr_src_alloc04)(F90_Desc *sd, __NELEM_T *nelem,
                              DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_SRC_ALLOC04A, ptr_src_alloc04a)(sd, nelem,
+                             kind, len, stat,
+                             pointer, offset,
+                             firsttime, align,
+                             CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_SRC_ALLOC04, sh_ptr_src_alloc04)(int id, F90_Desc *sd, __NELEM_T *nelem,
+                             __INT_T *kind, __INT_T *len, __STAT_T *stat,
+                             char **pointer, __POINT_T *offset,
+                             __INT_T *firsttime, __NELEM_T *align,
+                             DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_SRC_ALLOC04A, sh_ptr_src_alloc04a)(id, sd, nelem,
                              kind, len, stat,
                              pointer, offset,
                              firsttime, align,
@@ -1323,6 +2120,37 @@ ENTF90(PTR_SRC_CALLOC04A, ptr_src_calloc04a)
                       *align, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_PTR_SRC_CALLOC04A, sh_ptr_src_calloc04a)
+                             (int id, F90_Desc *sd, __NELEM_T *nelem, __INT_T *kind,
+                              __INT_T *len, __STAT_T *stat, char **pointer,
+                              __POINT_T *offset, __INT_T *firsttime,
+                              __NELEM_T *align, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  __INT_T src_len, max_len;
+
+  src_len = ENTF90(GET_OBJECT_SIZE, get_object_size)(sd);
+  if (sd && sd->tag == __DESC) {
+    if (sd->lsize > 1) {
+      src_len *= sd->lsize;
+    } else if (!sd->rank && !sd->lsize && !sd->gsize && sd->len > 0 &&
+               sd->kind > 0 && sd->kind <= __NTYPES) {
+      src_len = sd->len;
+    }
+  }
+  max_len = (len && nelem) ? (*len * *nelem) : 0;
+  if (max_len < src_len)
+    max_len = src_len;
+
+  if (ISPRESENT(stat) && firsttime && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)max_len, stat, pointer,
+                      offset, 0, 0, LOCAL_MODE ? __sh_fort_calloc_without_abort
+                                               : __sh_fort_gcalloc_without_abort,
+                      *align, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_SRC_CALLOC04, ptr_src_calloc04)
@@ -1332,6 +2160,19 @@ ENTF90(PTR_SRC_CALLOC04, ptr_src_calloc04)
                               __NELEM_T *align, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_SRC_CALLOC04A, ptr_src_calloc04a)(sd, nelem, kind,
+                              len, stat, pointer,
+                              offset, firsttime,
+                              align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_SRC_CALLOC04, sh_ptr_src_calloc04)
+                             (int id, F90_Desc *sd, __NELEM_T *nelem, __INT_T *kind,
+                              __INT_T *len, __STAT_T *stat, char **pointer,
+                              __POINT_T *offset, __INT_T *firsttime,
+                              __NELEM_T *align, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_SRC_CALLOC04A, sh_ptr_src_calloc04a)(id, sd, nelem, kind,
                               len, stat, pointer,
                               offset, firsttime,
                               align, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
@@ -1352,6 +2193,17 @@ ENTF90(PTR_KALLOC, ptr_kalloc)(__INT8_T *nelem, __INT_T *kind,
 }
 
 void
+ENTF90(SH_PTR_KALLOC, sh_ptr_kalloc)(int id, __INT8_T *nelem, __INT_T *kind,
+                               __INT_T *len, __STAT_T *stat,
+                               char **pointer, __POINT_T *offset,
+                               DCHAR(base) DCLEN(base))
+{
+  (void)I8(__sh_fort_kalloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 0,
+      LOCAL_MODE ? __sh_fort_malloc_without_abort : __sh_fort_gmalloc_without_abort);
+}
+
+void
 ENTF90(PTR_CALLOC, ptr_calloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
                                __STAT_T *stat, char **pointer,
                                __POINT_T *offset, DCHAR(base) DCLEN(base))
@@ -1359,6 +2211,16 @@ ENTF90(PTR_CALLOC, ptr_calloc)(__INT_T *nelem, __INT_T *kind, __INT_T *len,
   (void)I8(__fort_alloc)(
       *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 0,
       LOCAL_MODE ? __fort_calloc_without_abort : __fort_gcalloc_without_abort);
+}
+
+void
+ENTF90(SH_PTR_CALLOC, sh_ptr_calloc)(int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                               __STAT_T *stat, char **pointer,
+                               __POINT_T *offset, DCHAR(base) DCLEN(base))
+{
+  (void)I8(__sh_fort_alloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 0,
+      LOCAL_MODE ? __sh_fort_calloc_without_abort : __sh_fort_gcalloc_without_abort);
 }
 
 void
@@ -1376,6 +2238,21 @@ ENTF90(PTR_CALLOC03A, ptr_calloc03a)
                       0, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_PTR_CALLOC03A, sh_ptr_calloc03a)
+                         (int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                          __STAT_T *stat, char **pointer, __POINT_T *offset,
+                          __INT_T *firsttime, DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 0, LOCAL_MODE ? __sh_fort_calloc_without_abort
+                                       : __sh_fort_gcalloc_without_abort,
+                      0, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_CALLOC03, ptr_calloc03)
@@ -1384,6 +2261,17 @@ ENTF90(PTR_CALLOC03, ptr_calloc03)
                           __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_CALLOC03A, ptr_calloc03a)(nelem, kind, len,
+                          stat, pointer, offset,
+                          firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_PTR_CALLOC03, sh_ptr_calloc03)
+                         (int id, __INT_T *nelem, __INT_T *kind, __INT_T *len,
+                          __STAT_T *stat, char **pointer, __POINT_T *offset,
+                          __INT_T *firsttime, DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_CALLOC03A, sh_ptr_calloc03a)(id, nelem, kind, len,
                           stat, pointer, offset,
                           firsttime, CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
@@ -1404,6 +2292,22 @@ ENTF90(PTR_CALLOC04A, ptr_calloc04a)(__NELEM_T *nelem, __INT_T *kind,
                       *align, CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_PTR_CALLOC04A, sh_ptr_calloc04a)(int id, __NELEM_T *nelem, __INT_T *kind,
+                                   __INT_T *len, __STAT_T *stat,
+                                   char **pointer, __POINT_T *offset,
+                                   __INT_T *firsttime, __NELEM_T *align,
+                                   DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+
+  (void)I8(__sh_alloc04)(id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset,
+                      0, 0, LOCAL_MODE ? __sh_fort_calloc_without_abort
+                                       : __sh_fort_gcalloc_without_abort,
+                      *align, CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(PTR_CALLOC04, ptr_calloc04)(__NELEM_T *nelem, __INT_T *kind,
@@ -1413,6 +2317,19 @@ ENTF90(PTR_CALLOC04, ptr_calloc04)(__NELEM_T *nelem, __INT_T *kind,
                                    DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(PTR_CALLOC04A, ptr_calloc04a)(nelem, kind,
+                                   len, stat,
+                                   pointer, offset,
+                                   firsttime, align,
+                                   CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+void
+ENTF90(SH_PTR_CALLOC04, sh_ptr_calloc04)(int id, __NELEM_T *nelem, __INT_T *kind,
+                                   __INT_T *len, __STAT_T *stat,
+                                   char **pointer, __POINT_T *offset,
+                                   __INT_T *firsttime, __NELEM_T *align,
+                                   DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_PTR_CALLOC04A, sh_ptr_calloc04a)(id, nelem, kind,
                                    len, stat,
                                    pointer, offset,
                                    firsttime, align,
@@ -1430,6 +2347,17 @@ ENTF90(PTR_KCALLOC, ptr_kcalloc)(__INT8_T *nelem, __INT_T *kind,
       LOCAL_MODE ? __fort_calloc_without_abort : __fort_gcalloc_without_abort);
 }
 
+void
+ENTF90(SH_PTR_KCALLOC, sh_ptr_kcalloc)(int id, __INT8_T *nelem, __INT_T *kind,
+                                 __INT_T *len, __STAT_T *stat,
+                                 char **pointer, __POINT_T *offset,
+                                 DCHAR(base) DCLEN(base))
+{
+  (void)I8(__sh_fort_kalloc)(
+      id, *nelem, (dtype)*kind, (size_t)*len, stat, pointer, offset, CADR(base), 0,
+      LOCAL_MODE ? __sh_fort_calloc_without_abort : __sh_fort_gcalloc_without_abort);
+}
+
 /** \brief
  * Allocate global array (must be same size on all processors), return
  * pointer and pointer-sized integer offset from base address.  offset
@@ -1441,6 +2369,14 @@ I8(__fort_allocate)(int nelem, dtype kind, size_t len, char *base,
 {
   return I8(__fort_alloc)(nelem, kind, len, NULL, pointer, offset, base, 0,
                          __fort_gmalloc_without_abort);
+}
+
+char *
+I8(__sh_fort_allocate)(int id, int nelem, dtype kind, size_t len, char *base,
+                    char **pointer, __POINT_T *offset)
+{
+  return I8(__sh_fort_alloc)(id, nelem, kind, len, NULL, pointer, offset, base, 0,
+                         __sh_fort_gmalloc_without_abort);
 }
 
 /** \brief
@@ -1457,6 +2393,14 @@ I8(__fort_local_allocate)(int nelem, dtype kind, size_t len, char *base,
                          __fort_malloc_without_abort);
 }
 
+char *
+I8(__sh_fort_local_allocate)(int id, int nelem, dtype kind, size_t len, char *base,
+                          char **pointer, __POINT_T *offset)
+{
+  return I8(__sh_fort_alloc)(id, nelem, kind, len, NULL, pointer, offset, base, 0,
+                         __sh_fort_malloc_without_abort);
+}
+
 /** \brief
  * Allocate global array (must be same size on all processors), return
  * pointer and pointer-sized integer offset from base address.  offset
@@ -1468,6 +2412,14 @@ I8(__fort_kallocate)(long nelem, dtype kind, size_t len, char *base,
 {
   return I8(__fort_kalloc)(nelem, kind, len, NULL, pointer, offset, base, 0,
                           __fort_gmalloc_without_abort);
+}
+
+char *
+I8(__sh_fort_kallocate)(int id, long nelem, dtype kind, size_t len, char *base,
+                     char **pointer, __POINT_T *offset)
+{
+  return I8(__sh_fort_kalloc)(id, nelem, kind, len, NULL, pointer, offset, base, 0,
+                          __sh_fort_gmalloc_without_abort);
 }
 
 /** \brief
@@ -1485,11 +2437,52 @@ I8(__fort_local_kallocate)(long nelem, dtype kind, size_t len, char *base,
                           __fort_malloc_without_abort);
 }
 
+char *
+I8(__sh_fort_local_kallocate)(int id, long nelem, dtype kind, size_t len, char *base,
+                           char **pointer, __POINT_T *offset)
+{
+  return I8(__sh_fort_kalloc)(id, nelem, kind, len, NULL, pointer, offset, base, 0,
+                          __sh_fort_malloc_without_abort);
+}
+
 /** \brief
  * Deallocate array using given 'free' function
  */
 char *
 I8(__fort_dealloc)(char *area, __STAT_T *stat, void (*freefn)(void *))
+{
+  ALLO_HDR *p, *q;
+  char msg[80];
+
+  ALLHDR();
+
+  if (!ISPRESENT(stat))
+    stat = NULL;
+  if (!ISPRESENT(area))
+    area = NULL;
+  if (area) {
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d dealloc p %p area %p\n", GET_DIST_LCPU, p, area);
+#endif
+    freefn(XYZZY(area));
+    if (stat)
+      *stat = 0;
+    return area;
+  }
+  if (stat)
+    *stat = 1;
+  else {
+    MP_P_STDIO;
+    sprintf(msg, "DEALLOCATE: memory at %p not allocated", area);
+    MP_V_STDIO;
+    __fort_abort(msg);
+  }
+  return NULL;
+}
+
+char *
+I8(__sh_fort_dealloc)(char *area, __STAT_T *stat, void (*freefn)(void *))
 {
   ALLO_HDR *p, *q;
   char msg[80];
@@ -1565,6 +2558,50 @@ I8(__fort_dealloc03)(char *area, __STAT_T *stat, void (*freefn)(void *),
   return NULL;
 }
 
+static char *
+I8(__sh_fort_dealloc03)(char *area, __STAT_T *stat, void (*freefn)(void *),
+                     char *errmsg, int errlen)
+{
+  ALLO_HDR *p, *q;
+  char msg[80];
+
+  ALLHDR();
+
+  if (!ISPRESENT(stat))
+    stat = NULL;
+  if (!ISPRESENT(area))
+    area = NULL;
+  if (!ISPRESENT(errmsg))
+    errmsg = NULL;
+  if (area) {
+#if defined(DEBUG)
+    if (__fort_test & DEBUG_ALLO)
+      printf("%d dealloc p %p area %p\n", GET_DIST_LCPU, p, area);
+#endif
+    freefn(XYZZY(area));
+    return area;
+  }
+  if (stat) {
+    *stat = 1;
+    if (errmsg) {
+      int i;
+      char *mp;
+      MP_P_STDIO;
+      sprintf(msg, "Memory at %p not allocated", area);
+      mp = msg;
+      for (i = 0; i < errlen; i++)
+        errmsg[i] = (*mp ? *mp++ : ' ');
+      MP_V_STDIO;
+    }
+  } else {
+    MP_P_STDIO;
+    sprintf(msg, "DEALLOCATE: memory at %p not allocated", area);
+    MP_V_STDIO;
+    __fort_abort(msg);
+  }
+  return NULL;
+}
+
 /** \brief
  * F77 deallocate statement
  */
@@ -1592,11 +2629,26 @@ ENTF90(DEALLOCA, dealloca)(__STAT_T *stat, DCHAR(area) DCLEN64(area))
                           LOCAL_MODE ? __fort_free : __fort_gfree);
 }
 
+void
+ENTF90(SH_DEALLOCA, sh_dealloca)(__STAT_T *stat, DCHAR(area) DCLEN64(area))
+{
+  if (reuse_alloc(stat, CADR(area)))
+    return;
+  (void)I8(__sh_fort_dealloc)(CADR(area), stat,
+                          LOCAL_MODE ? __sh_fort_free : __sh_fort_gfree);
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(DEALLOC, dealloc)(__STAT_T *stat, DCHAR(area) DCLEN(area))
 {
   ENTF90(DEALLOCA, dealloca)(stat, CADR(area), (__CLEN_T)CLEN(area));
+}
+
+void
+ENTF90(SH_DEALLOC, sh_dealloc)(__STAT_T *stat, DCHAR(area) DCLEN(area))
+{
+  ENTF90(SH_DEALLOCA, sh_dealloca)(stat, CADR(area), (__CLEN_T)CLEN(area));
 }
 
 void
@@ -1612,6 +2664,19 @@ ENTF90(DEALLOC03A, dealloc03a)(__STAT_T *stat, char *area,
                             CADR(errmsg), CLEN(errmsg));
 }
 
+void
+ENTF90(SH_DEALLOC03A, sh_dealloc03a)(__STAT_T *stat, char *area,
+                             __INT_T *firsttime,
+                             DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (ISPRESENT(stat) && *firsttime)
+    *stat = 0;
+  if (reuse_alloc(stat, area))
+    return;
+  (void)I8(__sh_fort_dealloc03)(area, stat, LOCAL_MODE ? __fort_free : __fort_gfree,
+                            CADR(errmsg), CLEN(errmsg));
+}
+
 /* 32 bit CLEN version */
 void
 ENTF90(DEALLOC03, dealloc03)(__STAT_T *stat, char *area,
@@ -1619,6 +2684,16 @@ ENTF90(DEALLOC03, dealloc03)(__STAT_T *stat, char *area,
                              DCHAR(errmsg) DCLEN(errmsg))
 {
   ENTF90(DEALLOC03A, dealloc03a)(stat, area,
+                             firsttime,
+                             CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
+ENTF90(SH_DEALLOC03, sh_dealloc03)(__STAT_T *stat, char *area,
+                             __INT_T *firsttime,
+                             DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_DEALLOC03A, sh_dealloc03a)(stat, area,
                              firsttime,
                              CADR(errmsg), (__CLEN_T)CLEN(errmsg));
 }
@@ -1633,12 +2708,32 @@ ENTF90(DEALLOC_MBR, dealloc_mbr)(__STAT_T *stat, DCHAR(area) DCLEN(area))
 }
 
 void
+ENTF90(SH_DEALLOC_MBR, sh_dealloc_mbr)(__STAT_T *stat, DCHAR(area) DCLEN(area))
+{
+
+  if (I8(__fort_allocated)(CADR(area))) {
+    ENTF90(SH_DEALLOC, sh_dealloc)(stat, CADR(area), CLEN(area));
+  }
+}
+
+void
 ENTF90(DEALLOC_MBR03A, dealloc_mbr03a)(__STAT_T *stat, char *area,
                                           __INT_T *firsttime,
                                           DCHAR(errmsg) DCLEN64(errmsg))
 {
   if (I8(__fort_allocated)(area)) {
     ENTF90(DEALLOC03,dealloc03)(stat, area, firsttime,
+                CADR(errmsg), CLEN(errmsg));
+  }
+}
+
+void
+ENTF90(SH_DEALLOC_MBR03A, sh_dealloc_mbr03a)(__STAT_T *stat, char *area,
+                                          __INT_T *firsttime,
+                                          DCHAR(errmsg) DCLEN64(errmsg))
+{
+  if (I8(__fort_allocated)(area)) {
+    ENTF90(SH_DEALLOC03,sh_dealloc03)(stat, area, firsttime,
                 CADR(errmsg), CLEN(errmsg));
   }
 }
@@ -1654,9 +2749,24 @@ ENTF90(DEALLOC_MBR03, dealloc_mbr03)(__STAT_T *stat, char *area,
 }
 
 void
+ENTF90(SH_DEALLOC_MBR03, sh_dealloc_mbr03)(__STAT_T *stat, char *area,
+                                          __INT_T *firsttime,
+                                          DCHAR(errmsg) DCLEN(errmsg))
+{
+  ENTF90(SH_DEALLOC_MBR03A, sh_dealloc_mbr03a)(stat, area, firsttime,
+                                          CADR(errmsg), (__CLEN_T)CLEN(errmsg));
+}
+
+void
 ENTF90(DEALLOCX, deallocx)(__STAT_T *stat, char **area)
 {
   (void)I8(__fort_dealloc)(*area, stat, LOCAL_MODE ? __fort_free : __fort_gfree);
+}
+
+void
+ENTF90(SH_DEALLOCX, sh_deallocx)(__STAT_T *stat, char **area)
+{
+  (void)I8(__sh_fort_dealloc)(*area, stat, LOCAL_MODE ? __fort_free : __fort_gfree);
 }
 
 /** \brief
@@ -1668,6 +2778,12 @@ I8(__fort_deallocate)(char *area)
   (void)I8(__fort_dealloc)(area, NULL, __fort_gfree);
 }
 
+void
+I8(__sh_fort_deallocate)(char *area)
+{
+  (void)I8(__sh_fort_dealloc)(area, NULL, __fort_gfree);
+}
+
 /** \brief
  * deallocate local array
  */
@@ -1676,6 +2792,12 @@ void
 I8(__fort_local_deallocate)(char *area)
 {
   (void)I8(__fort_dealloc)(area, NULL, __fort_free);
+}
+
+void
+I8(__sh_fort_local_deallocate)(char *area)
+{
+  (void)I8(__sh_fort_dealloc)(area, NULL, __sh_fort_free);
 }
 
 static size_t AUTO_ALN_MINSZ = 128000;
@@ -1728,6 +2850,52 @@ I8(__auto_alloc)(__NELEM_T nelem, __INT_T sz,
   return area;
 }
 
+static void *
+I8(__sh_auto_alloc)(int id, __NELEM_T nelem, __INT_T sz,
+                    void *(*mallocroutine)(int, size_t))
+{
+  char *p, *area;
+  size_t size, need;
+  char msg[80];
+
+#define AUTO_ALN_THRESH (AUTO_ALN_MAXADJ / AUTO_ALN_UNIT)
+  static int aln_n = 0;
+  int myaln;
+
+  if (nelem > 0)
+    need = nelem * sz;
+  else
+    need = 0;
+
+  size = ((need + (ASZ - 1)) & ~(ASZ - 1)) + AUTOASZ; /* quad-alignment */
+
+  if (size > AUTO_ALN_MINSZ) {
+    myaln = aln_n;
+    size += AUTO_ALN_UNIT * myaln;
+    if (aln_n < AUTO_ALN_THRESH)
+      aln_n++;
+    else
+      aln_n = 0;
+  }
+
+  p = (char *)(mallocroutine)(id, size);
+  if (p == NULL) {
+    MP_P_STDIO;
+    sprintf(msg, "ALLOCATE: %lu bytes requested; not enough memory", need);
+    MP_V_STDIO;
+    __fort_abort(msg);
+  }
+
+  area = (char *)p + AUTOASZ; /* quad-alignment */
+
+  if (size > AUTO_ALN_MINSZ)
+    area += AUTO_ALN_UNIT * myaln;
+
+  XYZZYP(area, p);
+
+  return area;
+}
+
 #ifndef DESC_I8
 /*
  * Simple globally visible by value auto_alloc;
@@ -1737,6 +2905,14 @@ ENTF90(AUTO_ALLOCV, auto_allocv)(__NELEM_T nelem, int sz)
 {
   void *p;
   p = I8(__auto_alloc)(nelem, sz, malloc);
+  return p;
+}
+
+void *
+ENTF90(SH_AUTO_ALLOCV, sh_auto_allocv)(int id, __NELEM_T nelem, int sz)
+{
+  void *p;
+  p = I8(__sh_auto_alloc)(id, nelem, sz, malloc);
   return p;
 }
 #endif
@@ -1751,11 +2927,29 @@ ENTF90(AUTO_ALLOC, auto_alloc)(__INT_T *nelem, __INT_T *sz)
 }
 
 void *
+ENTF90(SH_AUTO_ALLOC, sh_auto_alloc)(int id, __INT_T *nelem, __INT_T *sz)
+{
+  void *p;
+
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
+  return p;
+}
+
+void *
 ENTF90(AUTO_ALLOC04, auto_alloc04)(__NELEM_T *nelem, __INT_T *sz)
 {
   void *p;
 
   p = I8(__auto_alloc)(*nelem, *sz, malloc);
+  return p;
+}
+
+void *
+ENTF90(SH_AUTO_ALLOC04, sh_auto_alloc04)(int id, __NELEM_T *nelem, __INT_T *sz)
+{
+  void *p;
+
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
   return p;
 }
 
@@ -1766,6 +2960,21 @@ ENTF90(AUTO_CALLOC, auto_calloc)(__INT_T *nelem, __INT_T *sz)
   void *p;
 
   p = I8(__auto_alloc)(*nelem, *sz, malloc);
+  if (p && *nelem > 0) {
+    size = *nelem * *sz;
+    memset(p, 0, size);
+  }
+
+  return p;
+}
+
+void *
+ENTF90(SH_AUTO_CALLOC, sh_auto_calloc)(int id, __INT_T *nelem, __INT_T *sz)
+{
+  size_t size;
+  void *p;
+
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
   if (p && *nelem > 0) {
     size = *nelem * *sz;
     memset(p, 0, size);
@@ -1789,8 +2998,26 @@ ENTF90(AUTO_CALLOC04, auto_calloc04)(__NELEM_T *nelem, __INT_T *sz)
   return p;
 }
 
+void *
+ENTF90(SH_AUTO_CALLOC04, sh_auto_calloc04)(int id, __NELEM_T *nelem, __INT_T *sz)
+{
+  size_t size;
+  void *p;
+
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
+  if (p && *nelem > 0) {
+    size = *nelem * *sz;
+    memset(p, 0, size);
+  }
+
+  return p;
+}
+
 void
 ENTF90(AUTO_DEALLOC, auto_dealloc)(void *area) { free(XYZZY(area)); }
+
+void
+ENTF90(SH_AUTO_DEALLOC, sh_auto_dealloc)(void *area) { sh_free(XYZZY(area)); }
 
 #if defined(DEBUG)
 void
