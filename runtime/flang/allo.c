@@ -2673,7 +2673,7 @@ ENTF90(SH_DEALLOC03A, sh_dealloc03a)(__STAT_T *stat, char *area,
     *stat = 0;
   if (reuse_alloc(stat, area))
     return;
-  (void)I8(__sh_fort_dealloc03)(area, stat, LOCAL_MODE ? __fort_free : __fort_gfree,
+  (void)I8(__sh_fort_dealloc03)(area, stat, LOCAL_MODE ? __sh_fort_free : __sh_fort_gfree,
                             CADR(errmsg), CLEN(errmsg));
 }
 
