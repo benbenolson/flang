@@ -2912,7 +2912,7 @@ void *
 ENTF90(SH_AUTO_ALLOCV, sh_auto_allocv)(int id, __NELEM_T nelem, int sz)
 {
   void *p;
-  p = I8(__sh_auto_alloc)(id, nelem, sz, malloc);
+  p = I8(__sh_auto_alloc)(id, nelem, sz, sh_alloc);
   return p;
 }
 #endif
@@ -2931,7 +2931,7 @@ ENTF90(SH_AUTO_ALLOC, sh_auto_alloc)(int id, __INT_T *nelem, __INT_T *sz)
 {
   void *p;
 
-  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, sh_alloc);
   return p;
 }
 
@@ -2949,7 +2949,7 @@ ENTF90(SH_AUTO_ALLOC04, sh_auto_alloc04)(int id, __NELEM_T *nelem, __INT_T *sz)
 {
   void *p;
 
-  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, sh_alloc);
   return p;
 }
 
@@ -2974,7 +2974,7 @@ ENTF90(SH_AUTO_CALLOC, sh_auto_calloc)(int id, __INT_T *nelem, __INT_T *sz)
   size_t size;
   void *p;
 
-  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, sh_alloc);
   if (p && *nelem > 0) {
     size = *nelem * *sz;
     memset(p, 0, size);
@@ -3004,7 +3004,7 @@ ENTF90(SH_AUTO_CALLOC04, sh_auto_calloc04)(int id, __NELEM_T *nelem, __INT_T *sz
   size_t size;
   void *p;
 
-  p = I8(__sh_auto_alloc)(id, *nelem, *sz, malloc);
+  p = I8(__sh_auto_alloc)(id, *nelem, *sz, sh_alloc);
   if (p && *nelem > 0) {
     size = *nelem * *sz;
     memset(p, 0, size);
