@@ -74,7 +74,6 @@ SET(PGC_SRC_FILES
   nint.c
   # src-mp files
   llcrit.c
-  numa.c
   )
 
 add_flang_library(flangrti_static
